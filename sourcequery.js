@@ -1,35 +1,54 @@
-var dgram = require('dgram')
-  , bp = require('bufferpack')
-  ;
+var dgram = require('dgram');
+var SmartBuffer = require('smart-buffer');
 
 var Answer = function() {
     this.compressed = false;
 	this.parts = [];
-    this.partsfound = 0;
 };
 
-Answer.prototype.add = function(id, buffer) {
-	var head = bp.unpack('<ibbh', buffer);
-	if ((head[0] & 0x80000000) !== 0) {
+Answer.prototype.add = function(id, reader) {
+	if ((id & 0x80000000) !== 0) {
 		this.compressed = true;
 	}
-	this.totalpackets = head[1];
-    this.partsfound++;
-	this.parts[head[2]] = buffer;
+	this.totalpackets = reader.readUInt8();
+	this.parts[reader.readUInt8()] = reader;
 };
 Answer.prototype.isComplete = function() {
-	return (this.partsfound == this.totalpackets);
+	return (this.parts.length == this.totalpackets);
 };
 Answer.prototype.assemble = function() {
 	var combined = [];
 	for (var i = 0; i < this.parts.length; i++) {
-		var head = bp.unpack('<ibb', this.parts[i]);
-        combined.push(this.parts[i].slice(head[2] == 1 ? 16 : 8));
+		var reader = this.parts[i];
+		reader.skip(i === 0 ? 6 : 2);
+        combined.push(reader.toBuffer().slice(reader.length - reader.remaining()));
 	}
-    var payload = Buffer.concat(combined).slice(4);
+	
+	for(var i = 0; i < combined.length; i++) {
+		var output = '';
+		var pointer = 0;
+		while(pointer < combined[i].length) {
+			var text = '';
+			for(j = 0; j < 16 && pointer < combined[i].length; j++) {
+				var num = combined[i].readInt8(pointer).toString(16);
+				if(num.length == 1) {
+					num = '0' + num;
+				}
+				
+				output += num + ' ';
+				text += String.fromCharCode(combined[i].readInt8(pointer));
+				pointer++;
+			}
+			
+			output += "\t\t\t" + text + "\n";
+		}
+	}
+	
+    var payload = Buffer.concat(combined);
     if (this.compressed) {
         console.warn('COMPRESSION NOT SUPPORTED. PAYLOAD:', payload);
     }
+	
     return payload;
 };
 
@@ -45,16 +64,19 @@ SQUnpacker.prototype = Object.create(require('events').EventEmitter.prototype);
 SQUnpacker.prototype.readMessage = function(buffer, remote){
     var that = this;
     
-	var header = bp.unpack('<i', buffer)[0];
+	var reader = new SmartBuffer(buffer);
+	var header = reader.readInt32LE();
 	buffer = buffer.slice(4);
 
 	if (header == -1) {
+		// No need to build an Answer, this is a single-packet response
 		this.emit('message', buffer, remote);
 		return;
 	}
 	
 	if (header == -2) {
-		var ansID = bp.unpack('<i', buffer)[0];
+		// Split response
+		var ansID = reader.readInt32LE();
 		var ans = this.answers[ansID];
 		if (!ans) {
 			ans = this.answers[ansID] = new Answer();
@@ -64,7 +86,7 @@ SQUnpacker.prototype.readMessage = function(buffer, remote){
                 delete that.answers[ansID];
             }, this.timeout);
 		}
-		ans.add(ansID, buffer);
+		ans.add(ansID, reader);
 		
 		if (ans.isComplete()) {
 			this.emit('message', ans.assemble(), remote);
@@ -102,9 +124,15 @@ var SourceQuery = function(timeout){
         S2A_RULES: 'E'
     };
     
-    var send = function(buffer, responseCode, cb) {
+    var send = function(writer, responseCode, cb) {
 		cb = cb || function(){};
 		openQueries++;
+		var buffer = writer.toBuffer();
+		
+		if(typeof responseCode === 'string') {
+			responseCode = responseCode.charCodeAt(0);
+		}
+		
         sq.client.send(buffer, 0, buffer.length, sq.port, sq.address, function(err, bytes){
             var giveUpTimer;
         
@@ -118,12 +146,15 @@ var SourceQuery = function(timeout){
                 if (buffer.length < 1)
                     return;
                 
-                if (bp.unpack('<s', buffer)[0] !== responseCode)
+				var reader = new SmartBuffer(buffer);
+				
+				var res = reader.readUInt8();
+                if (res !== responseCode)
                     return;
                 
                 sq.squnpacker.removeListener('message', relayResponse);
                 clearTimeout(giveUpTimer);
-                cb(null, buffer.slice(1));
+                cb(null, reader);
 				queryEnded();
             };
             
@@ -155,79 +186,80 @@ var SourceQuery = function(timeout){
     
     sq.getChallengeKey = function(reqType, cb) {
 		cb = cb || function(){};
-        send(bp.pack('<isi', [-1, reqType, -1]), ids.S2A_SERVERQUERY_GETCHALLENGE, function(err, buffer){
+		var writer = new SmartBuffer();
+		writer.writeInt32LE(-1);
+		writer.writeUInt8(reqType.charCodeAt(0));
+		writer.writeInt32LE(-1);
+        send(writer, ids.S2A_SERVERQUERY_GETCHALLENGE, function(err, reader){
             if (err) {
-                cb(err, buffer);
+                cb(err, reader);
                 return;
             }
             
-            cb(null, bp.unpack('<i', buffer)[0]);
+            cb(null, reader.readInt32LE());
         });
     };
     
     sq.getInfo = function(cb) {
 		cb = cb || function(){};
-        send(bp.pack('<isS', [-1, ids.A2S_INFO, 'Source Engine Query']), ids.S2A_INFO, function(err, buffer){
+		var writer = new SmartBuffer();
+		writer.writeInt32LE(-1);
+		writer.writeUInt8(ids.A2S_INFO.charCodeAt(0));
+		writer.writeStringNT("Source Engine Query");
+        send(writer, ids.S2A_INFO, function(err, reader){
             if (err) {
-                cb(err, buffer);
+                cb(err, reader);
                 return;
             }
             
-            var infoArray = bp.unpack('<bSSSShBBBssBB', buffer);
-            var info = combine(
-                ['protocol', 'name', 'map', 'folder', 'game', 'appid', 'players', 'maxplayers', 'bots', 'servertype', 'environment', 'password', 'vac'],
-                infoArray
-            );
-            
-            var offset = bp.calcLength('<bSSSShBBBssBB', infoArray);
-            buffer = buffer.slice(offset);
+			var info = {
+				"protocol": reader.readInt8(),
+				"name": reader.readStringNT(),
+				"map": reader.readStringNT(),
+				"folder": reader.readStringNT(),
+				"game": reader.readStringNT(),
+				"appid": reader.readInt16LE(),
+				"players": reader.readUInt8(),
+				"maxplayers": reader.readUInt8(),
+				"bots": reader.readUInt8(),
+				"servertype": String.fromCharCode(reader.readUInt8()),
+				"environment": String.fromCharCode(reader.readUInt8()),
+				"password": reader.readUInt8(),
+				"secure": reader.readUInt8()
+			};
             
             // if "The Ship"
             if (info.appid == 2400) {
-                var shipInfo = combine(
-                    ['ship-mode','ship-witnesses','ship-duration'],
-                    bp.unpack('<bbb', buffer)
-                );
-                for (var i in shipInfo) {
-                    info[i] = shipInfo[i];
-                }
-                buffer = buffer.slice(3);
+				info['ship-mode'] = reader.readInt8();
+				info['ship-witnesses'] = reader.readInt8();
+				info['ship-duration'] = reader.readInt8();
             }
             
-            info.version = bp.unpack('<S', buffer)[0];
-            offset = bp.calcLength('<S', [info.version]);
-            buffer = buffer.slice(offset);
+            info.version = reader.readStringNT();
             
-            if (buffer.length > 1) {
-                offset = 0;
-                var EDF = bp.unpack('<b', buffer)[0];
-                offset += 1;
+            if (reader.remaining() > 1) {
+                var EDF = reader.readInt8();
                 
                 if ((EDF & 0x80) !== 0) {
-                    info.port = bp.unpack('<h', buffer, offset)[0];
-                    offset += 2;
+                    info.port = reader.readInt16LE();
                 }
                 
                 if ((EDF & 0x10) !== 0) {
-                    info.steamID = bp.unpack('<ii', buffer, offset)[0];
-                    offset += 8;
+                    info.steamID = reader.readInt32LE(); // This gives is the accountid
+					info.steamIDUpper = reader.readInt32LE();
                 }
                 
                 if ((EDF & 0x40) !== 0) {
-                    var tvinfo = bp.unpack('<hS', buffer, offset);
-                    info['tv-port'] = tvinfo[0];
-                    info['tv-name'] = tvinfo[1];
-                    offset += bp.calcLength('<hS', tvinfo);
+                    info['tv-port'] = reader.readInt16LE();
+                    info['tv-name'] = reader.readStringNT();
                 }
                 
                 if ((EDF & 0x20) !== 0) {
-                    info.keywords = bp.unpack('<S', buffer, offset)[0];
-                    offset += bp.calcLength('<S', info.keywords);
+                    info.keywords = reader.readStringNT();
                 }
                 
                 if ((EDF & 0x01) !== 0) {
-                    info.gameID = bp.unpack('<i', buffer, offset)[0];
-                    offset += 4;
+                    info.gameID = reader.readInt32LE();
                 }
             }
             
@@ -242,23 +274,27 @@ var SourceQuery = function(timeout){
                 cb(err, key);
                 return;
             }
+			
+			var writer = new SmartBuffer();
+			writer.writeInt32LE(-1);
+			writer.writeUInt8(ids.A2S_PLAYER.charCodeAt(0));
+			writer.writeInt32LE(key);
         
-            send(bp.pack('<isi', [-1, ids.A2S_PLAYER, key]), ids.S2A_PLAYER, function(err, buffer){
+            send(writer, ids.S2A_PLAYER, function(err, reader){
                 if (err) {
-                    cb(err, buffer);
+                    cb(err, reader);
                     return;
                 }
             
-                var playerCount = bp.unpack('<b', buffer)[0];
+                var playerCount = reader.readUInt8();
                 var players = [];
-                var offset = 1;
                 for (var i = 0; i < playerCount; i++) {
-                    var p = bp.unpack('<bSif', buffer, offset);
-                    players.push(combine(
-                        ['index', 'name', 'score', 'online'],
-                        p
-                    ));
-                    offset += bp.calcLength('<bSif', p);
+					players.push({
+						"index": reader.readUInt8(),
+						"name": reader.readStringNT(),
+						"score": reader.readInt32LE(),
+						"online": reader.readFloatLE()
+					});
                 }
                 cb(null, players);
             });
@@ -272,20 +308,24 @@ var SourceQuery = function(timeout){
                 cb(err, key);
                 return;
             }
+			
+			var writer = new SmartBuffer();
+			writer.writeInt32LE(-1);
+			writer.writeUInt8(ids.A2S_RULES.charCodeAt(0));
+			writer.writeInt32LE(key);
         
-            send(bp.pack('<isi', [-1, ids.A2S_RULES, key]), ids.S2A_RULES, function(err, buffer){
+            send(writer, ids.S2A_RULES, function(err, reader){
                 if (err) {
-                    cb(err, buffer);
+                    cb(err, reader);
                     return;
                 }
             
-                var ruleCount = bp.unpack('<h', buffer)[0];
-                var rules = [];
-                var offset = 2;
+                var ruleCount = reader.readInt16LE();
+                var rules = {};
                 for (var i = 0; i < ruleCount; i++) {
-                    var r = bp.unpack('<SS', buffer, offset);
-                    rules.push(combine(['name', 'value'], r));
-                    offset += bp.calcLength('<SS', r);
+                    var name = reader.readStringNT();
+					var value = reader.readStringNT();
+					rules[name] = value;
                 }
                 cb(null, rules);
             });
