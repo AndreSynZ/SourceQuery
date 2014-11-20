@@ -19,7 +19,7 @@ Answer.prototype.add = function(id, reader) {
 	this.parts[packetnum] = reader;
 };
 Answer.prototype.isComplete = function() {
-	return (this.parts.length == this.totalpackets);
+	return (this.parts.filter(function(item) { return !!item; }).length == this.totalpackets);
 };
 Answer.prototype.assemble = function() {
 	var combined = [];
