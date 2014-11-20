@@ -11,7 +11,12 @@ Answer.prototype.add = function(id, reader) {
 		this.compressed = true;
 	}
 	this.totalpackets = reader.readUInt8();
-	this.parts[reader.readUInt8()] = reader;
+	var packetnum = reader.readUInt8();
+	if(packetnum >= this.totalpackets) {
+		return; // Invalid response
+	}
+	
+	this.parts[packetnum] = reader;
 };
 Answer.prototype.isComplete = function() {
 	return (this.parts.length == this.totalpackets);
